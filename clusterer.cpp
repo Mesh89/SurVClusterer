@@ -6,6 +6,7 @@
 #include <set>
 #include <unordered_map>
 #include <unistd.h>
+#include <stdexcept>
 
 #include "htslib/vcf.h"
 #include "htslib/kseq.h"
