@@ -75,6 +75,18 @@ std::string get_sv_type(bcf_hdr_t* hdr, bcf1_t* sv) {
     return svtype;
 }
 
+int get_sv_len(bcf_hdr_t* hdr, bcf1_t* sv) {
+	int* data = NULL;
+	int size = 0;
+	bcf_get_info_int32(hdr, sv, "SVLEN", &data, &size);
+	if (size > 0) {
+		int len = data[0];
+		delete[] data;
+		return len-1; // TODO: remove later, there is a bug in the current dataset and SVLEN is overestimated by 1
+	}
+	return 0;
+}
+
 int get_sv_end(bcf_hdr_t* hdr, bcf1_t* sv) {
     int* data = NULL;
     int size = 0;
@@ -85,10 +97,8 @@ int get_sv_end(bcf_hdr_t* hdr, bcf1_t* sv) {
         return end-1; // return 0-based
     }
 
-    bcf_get_info_int32(hdr, sv, "SVLEN", &data, &size);
-    if (size > 0) {
-        int svlen = data[0];
-        delete[] data;
+    int svlen = get_sv_len(hdr, sv);
+    if (svlen > 0) {
         return sv->pos + abs(svlen);
     }
 
@@ -115,12 +125,8 @@ struct sv_t {
     std::string id, chr, type, ins_seq, sample;
     int start, end;
     char str1, str2;
-    bool precise;
-
-    sv_t(std::string id, std::string chr, int start, char str1, int end, char str2, std::string type, std::string seq,
-         std::string sample, std::string precise)
-    : id(id), chr(chr), start(start), str1(str1), end(end), str2(str2), type(type), ins_seq(seq), sample(sample),
-    precise(precise == "PRECISE") {}
+    int _len = 0;
+    bool precise, incomplete_ass;
 
     sv_t(bcf_hdr_t* hdr, bcf1_t* vcf_sv, std::string& sample) : sample(sample), str1('N'), str2('N') {
     	bcf_unpack(vcf_sv, BCF_UN_INFO);
@@ -130,13 +136,15 @@ struct sv_t {
     	end = get_sv_end(hdr, vcf_sv);
     	type = get_sv_type(hdr, vcf_sv);
     	ins_seq = get_ins_seq(hdr, vcf_sv);
+    	_len = get_sv_len(hdr, vcf_sv);
     	precise = true;
+    	incomplete_ass = false;
     	if (bcf_get_info_flag(hdr, vcf_sv, "IMPRECISE", NULL, 0) == 1) precise = false;
+    	if (bcf_get_info_flag(hdr, vcf_sv, "INCOMPLETE_ASSEMBLY", NULL, 0) == 1) incomplete_ass = true;
     }
 
     int len() {
-        if (type == "INS") return ins_seq.length();
-        else return end-start;
+        return _len;
     }
 
     std::string to_string() {
@@ -180,7 +188,7 @@ int overlap(const sv_t& sv1, const sv_t& sv2) {
 }
 
 bool is_compatible(const sv_t& sv1, const sv_t& sv2) {
-    return distance(sv1, sv2) <= max_dist && overlap(sv1, sv2) >= min_overlap && abs((int)(sv1.ins_seq.length()-sv2.ins_seq.length())) <= max_dist;
+    return distance(sv1, sv2) <= max_dist && overlap(sv1, sv2) >= min_overlap; // && abs((int)(sv1.ins_seq.length()-sv2.ins_seq.length())) <= max_dist;
 }
 
 int median(std::vector<int>& v) {
@@ -246,11 +254,11 @@ std::vector<std::vector<int>> compute_minimal_clique_cover(int start, int end) {
 sv_t choose_sv(std::vector<sv_t>& svs) {
     std::unordered_map<std::string, int> counts;
     for (sv_t& sv : svs) {
-        if (sv.precise) {
+        if (sv.precise && !sv.incomplete_ass) {
             counts[sv.to_coordinates()]++;
         }
     }
-    if (counts.empty()) { // if no precise accepts imprecises
+    if (counts.empty()) { // if no precise accepts imprecise
         for (sv_t& sv : svs) {
             counts[sv.to_coordinates()]++;
         }
@@ -278,6 +286,7 @@ void print_cliques(std::vector<std::vector<int>>& cliques, htsFile* out_vcf_file
 	const char** coos = new const char*[n_samples];
 	const char** sizes = new const char*[n_samples]; // could be int, but I did not find an easy way to set a variable number of ints in the format
 	const char** prec = new const char*[n_samples];
+	const char** incomplete_ass = new const char*[n_samples];
 
 	std::vector<std::pair<sv_t, int> > sv_order;
 	for (auto& clique : cliques) {
@@ -328,6 +337,16 @@ void print_cliques(std::vector<std::vector<int>>& cliques, htsFile* out_vcf_file
 		bcf_update_info_int32(out_hdr, vcf_sv, "N_SAMPLES", &int_conv, 1);
 		int_conv = clique.size();
 		bcf_update_info_int32(out_hdr, vcf_sv, "N_SVS", &int_conv, 1);
+		bcf_update_info_flag(out_hdr, vcf_sv, "IMPRECISE", "", !chosen_sv.precise);
+		bcf_update_info_flag(out_hdr, vcf_sv, "INCOMPLETE_ASSEMBLY", "", chosen_sv.incomplete_ass);
+
+		if (!chosen_sv.ins_seq.empty()) {
+			bcf_update_info_string(out_hdr, vcf_sv, "SVINSSEQ", chosen_sv.ins_seq.c_str());
+		}
+		if (chosen_sv.len()) {
+			int_conv = chosen_sv.len();
+			bcf_update_info_int32(out_hdr, vcf_sv, "SVLEN", &int_conv, 1);
+		}
 
 		// set GT
 		int* gts = new int[n_samples];
@@ -341,29 +360,35 @@ void print_cliques(std::vector<std::vector<int>>& cliques, htsFile* out_vcf_file
 		std::vector<std::string> coos_str(n_samples);
 		std::vector<std::string> sizes_str(n_samples);
 		std::vector<std::string> prec_str(n_samples);
+		std::vector<std::string> incomplete_ass_str(n_samples);
 		for (sv_t& sv : clique_svs) {
 			if (!coos_str[sample2id[sv.sample]].empty()) {
 				coos_str[sample2id[sv.sample]] += ",";
 				sizes_str[sample2id[sv.sample]] += ",";
 				prec_str[sample2id[sv.sample]] += ",";
+				incomplete_ass_str[sample2id[sv.sample]] += ",";
 			}
 			coos_str[sample2id[sv.sample]] += std::to_string(sv.start) + "-" + std::to_string(sv.end);
-			sizes_str[sample2id[sv.sample]] += std::to_string(sv.end-sv.start);
+			sizes_str[sample2id[sv.sample]] += std::to_string(sv.len());
 			prec_str[sample2id[sv.sample]] += (sv.precise ? "P" : "I");
+			incomplete_ass_str[sample2id[sv.sample]] += (sv.incomplete_ass ? "T" : "F");
 		}
 		for (int i = 0; i < n_samples; i++) {
 			if (coos_str[i].empty()) {
 				coos_str[i] = ".";
 				sizes_str[i] = ".";
 				prec_str[i] = ".";
+				incomplete_ass_str[i] = ".";
 			}
 			coos[i] = coos_str[i].c_str();
 			sizes[i] = sizes_str[i].c_str();
 			prec[i] = prec_str[i].c_str();
+			incomplete_ass[i] = incomplete_ass_str[i].c_str();
 		}
 		bcf_update_format_string(out_hdr, vcf_sv, "CO", coos, n_samples);
-		bcf_update_format_string(out_hdr, vcf_sv, "SZ", sizes, n_samples);
+		bcf_update_format_string(out_hdr, vcf_sv, "LN", sizes, n_samples);
 		bcf_update_format_string(out_hdr, vcf_sv, "IP", prec, n_samples);
+		bcf_update_format_string(out_hdr, vcf_sv, "IC", incomplete_ass, n_samples);
 
 		if (bcf_write(out_vcf_file, out_hdr, vcf_sv) != 0) {
         	throw std::runtime_error("Failed to write record to " + std::string(out_vcf_file->fn));
@@ -433,6 +458,18 @@ bcf_hdr_t* generate_vcf_header() {
 			"one SV per sample may be clustered.\">";
 	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, n_svs_tag, &len));
 
+	const char* insseq_tag = "##INFO=<ID=SVINSSEQ,Number=1,Type=String,Description=\"Inserted sequence.\">";
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, insseq_tag, &len));
+
+	const char* svlen_tag = "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of the resulting SV.\">";
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, svlen_tag, &len));
+
+	const char* precise_tag = "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"Breakpoints and/or inserted sequence are imprecise.\">";
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, precise_tag, &len));
+
+	const char* incomplete_ass_tag = "##INFO=<ID=INCOMPLETE_ASSEMBLY,Number=0,Type=Flag,Description=\"Inserted sequence is too long and only part of it could be assembled.\">";
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, incomplete_ass_tag, &len));
+
 	// add FORMAT tags
 	const char* gt_tag = "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">";
 	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, gt_tag, &len));
@@ -441,12 +478,15 @@ bcf_hdr_t* generate_vcf_header() {
 	const char* og_sv_tag = "##FORMAT=<ID=CO,Number=1,Type=String,Description=\"Coordinates of the original SV(s).\">";
 	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, og_sv_tag, &len));
 
-	const char* sz_sv_tag = "##FORMAT=<ID=SZ,Number=1,Type=String,Description=\"Size(s) of the original SV(s).\">";
-	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, sz_sv_tag, &len));
+	const char* ln_sv_tag = "##FORMAT=<ID=LN,Number=1,Type=String,Description=\"Len(s) of the original SV(s). 0 means unavailable, e.g. for incomplete inserted sequences.\">";
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, ln_sv_tag, &len));
 
 	const char* pr_sv_tag = "##FORMAT=<ID=IP,Number=1,Type=String,Description=\"Whether the original SV(s) were precise (P) or imprecise (I). "
 			"Anything without an explicit IMPRECISE tag is considered precise.\">";
 	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, pr_sv_tag, &len));
+
+	const char* ic_sv_tag = "##FORMAT=<ID=IC,Number=1,Type=String,Description=\"Whether the original insertion had an incomplete assembly. "
+				"T is TRUE and F is FALSE.\">";
 
 	int i = 0;
 	for (std::string& sample_name : sample_names) {
