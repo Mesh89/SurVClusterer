@@ -18,3 +18,22 @@ cd SurVClusterer/
 ./build_htslib.sh
 cmake -DCMAKE_BUILD_TYPE=Release . && make
 ```
+
+## Usage
+
+SurVClusterer requires two files:
+
+```
+SurVClusterer filelist reference
+```
+
+where reference is the reference genome used to call the SVs, in FASTA format, and filelist is a list of the files to be clustered, in the format
+```
+SAMPLENAME1 /path/to/vcf/1
+SAMPLENAME2 /path/to/vcf/2
+```
+
+For a full list of the parameters, run
+```
+SurVClusterer -h
+```
