@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <set>
 #include <unordered_map>
-#include <unistd.h>
 #include <stdexcept>
 #include <mutex>
 
@@ -13,55 +12,9 @@
 #include "htslib/kseq.h"
 #include "libs/cptl_stl.h"
 #include "libs/cxxopts.h"
-KSEQ_INIT(int, read)
+#include "common.h"
 
 std::mutex mtx;
-
-
-struct chr_seq_t {
-    char* seq;
-    hts_pos_t len;
-
-    chr_seq_t(char* seq, hts_pos_t len) : seq(seq), len(len) {}
-    ~chr_seq_t() {delete[] seq;}
-};
-struct chr_seqs_map_t {
-    std::unordered_map<std::string, chr_seq_t*> seqs;
-    std::vector<std::string> ordered_contigs;
-
-    void read_fasta_into_map(std::string& reference_fname) {
-        FILE* fasta = fopen(reference_fname.c_str(), "r");
-        kseq_t* seq = kseq_init(fileno(fasta));
-        while (kseq_read(seq) >= 0) {
-            std::string seq_name = seq->name.s;
-            char* chr_seq = new char[seq->seq.l + 1];
-            strcpy(chr_seq, seq->seq.s);
-            seqs[seq_name] = new chr_seq_t(chr_seq, seq->seq.l);
-            ordered_contigs.push_back(seq_name);
-        }
-        kseq_destroy(seq);
-        fclose(fasta);
-    }
-
-    char* get_seq(std::string seq_name) {
-        return seqs[seq_name]->seq;
-    }
-
-    hts_pos_t get_len(std::string seq_name) {
-        return seqs[seq_name]->len;
-    }
-
-    void clear() {
-        for (auto& e : seqs) {
-            delete e.second;
-            e.second = NULL;
-        }
-    }
-
-    ~chr_seqs_map_t() {
-        clear();
-    }
-};
 
 
 std::unordered_map<std::string, int> sample2id;
@@ -69,114 +22,6 @@ std::vector<std::string> sample_names;
 chr_seqs_map_t chr_seqs;
 
 std::ofstream out_sv_file;
-
-
-std::string get_sv_type(bcf_hdr_t* hdr, bcf1_t* sv) {
-    char* data = NULL;
-    int len = 0;
-    if (bcf_get_info_string(hdr, sv, "SVTYPE", &data, &len) < 0) {
-        throw std::runtime_error("Failed to determine SVTYPE for sv " + std::string(sv->d.id));
-    }
-    std::string svtype = data;
-    delete[] data;
-    return svtype;
-}
-
-int get_sv_len(bcf_hdr_t* hdr, bcf1_t* sv) {
-	int* data = NULL;
-	int size = 0;
-	bcf_get_info_int32(hdr, sv, "SVLEN", &data, &size);
-	if (size > 0) {
-		int len = data[0];
-		delete[] data;
-		return len;
-	}
-	return 0;
-}
-
-int get_sv_end(bcf_hdr_t* hdr, bcf1_t* sv) {
-    int* data = NULL;
-    int size = 0;
-    bcf_get_info_int32(hdr, sv, "END", &data, &size);
-    if (size > 0) {
-        int end = data[0];
-        delete[] data;
-        return end-1; // return 0-based
-    }
-
-    int svlen = get_sv_len(hdr, sv);
-    if (svlen > 0) {
-        return sv->pos + abs(svlen);
-    }
-
-    throw std::runtime_error("SV " + std::string(sv->d.id) + "has no END or SVLEN annotation.");
-}
-
-std::string get_ins_seq(bcf_hdr_t* hdr, bcf1_t* sv) {
-	// priority to the ALT allele, if it is not symbolic and longer than just the padding base
-	char c = toupper(sv->d.allele[1][0]);
-	if ((c == 'A' || c == 'C' || c == 'G' || c == 'T' || c == 'N') && strlen(sv->d.allele[1]) > 1) {
-		return sv->d.allele[1];
-	}
-
-	// otherwise, look for SVINSSEQ (compliant with Manta)
-	char* data = NULL;
-	int size = 0;
-	bcf_get_info_string(hdr, sv, "SVINSSEQ", (void**) &data, &size);
-	if (data) return data;
-
-	return "";
-}
-
-struct sv_t {
-    std::string id, chr, type, ins_seq, sample;
-    int start, end;
-    char str1, str2;
-    int _len = 0;
-    bool precise, incomplete_ass;
-    int* gts = NULL, n_gts;
-
-    sv_t(bcf_hdr_t* hdr, bcf1_t* vcf_sv, std::string& sample) : sample(sample), str1('N'), str2('N') {
-    	bcf_unpack(vcf_sv, BCF_UN_INFO);
-    	id = vcf_sv->d.id;
-    	chr = bcf_seqname(hdr, vcf_sv);
-    	start = vcf_sv->pos;
-    	end = get_sv_end(hdr, vcf_sv);
-    	type = get_sv_type(hdr, vcf_sv);
-    	ins_seq = get_ins_seq(hdr, vcf_sv);
-    	_len = get_sv_len(hdr, vcf_sv);
-    	int n = 0;
-    	n_gts = bcf_get_genotypes(hdr, vcf_sv, &gts, &n);
-    	precise = true;
-    	incomplete_ass = false;
-    	if (bcf_get_info_flag(hdr, vcf_sv, "IMPRECISE", NULL, 0) == 1) precise = false;
-    	if (bcf_get_info_flag(hdr, vcf_sv, "INCOMPLETE_ASSEMBLY", NULL, 0) == 1) incomplete_ass = true;
-    }
-
-    int len() {
-        return _len;
-    }
-
-    std::string to_string() {
-        std::stringstream ss;
-        ss << sample << "." << id << "," << chr << ":" << start << "-" << end << "," << len() << ",";
-        ss << (precise ? "PRECISE" : "IMPRECISE");
-        return ss.str();
-    }
-
-    std::string to_coordinates() {
-    	std::stringstream ss;
-    	ss << chr << ":" << start << "-" << end;
-    	return ss.str();
-    }
-};
-bool operator < (const sv_t& sv1, const sv_t& sv2) {
-    if (sv1.chr != sv2.chr) return sv1.chr < sv2.chr;
-    return std::tie(sv1.start, sv1.end) < std::tie(sv2.start, sv2.end);
-}
-int distance(const sv_t& sv1, const sv_t& sv2) {
-    return std::max(abs(sv1.start-sv2.start), abs(sv1.end-sv2.end));
-}
 
 struct idx_size_t {
     int idx, size;
@@ -197,24 +42,22 @@ int max_prec_dist, max_imprec_dist, max_dist;
 double min_prec_frac_overlap, min_imprec_frac_overlap;
 int max_prec_len_diff, max_imprec_len_diff;
 
-int overlap(const sv_t& sv1, const sv_t& sv2) {
-    return std::max(0, std::min(sv1.end, sv2.end)-std::max(sv1.start, sv2.start));
+int distance(const sv_t& sv1, const sv_t& sv2) {
+    return std::max(abs(sv1.start-sv2.start), abs(sv1.end-sv2.end));
+}
+double overlap(const sv_t& sv1, const sv_t& sv2) {
+    int overlap_bp = std::max(0, std::min(sv1.end, sv2.end)-std::max(sv1.start, sv2.start));
+    return overlap_bp/double(std::min(sv1.end-sv1.start, sv2.end-sv2.start));
 }
 
 bool is_compatible(sv_t& sv1, sv_t& sv2) {
 	if (!sv1.precise || !sv2.precise) {
 		return  distance(sv1, sv2) <= max_imprec_dist &&
-				overlap(sv1, sv2)/double(std::min(sv1.end-sv1.start, sv2.end-sv2.start)) >= min_imprec_frac_overlap &&
+				overlap(sv1, sv2) >= min_imprec_frac_overlap &&
 				abs(sv1.len()-sv2.len()) <= max_imprec_len_diff;
-//	}
-//	if (sv1.precise && !sv2.precise) {
-//		return distance(sv1, sv2) <= max_imprec_dist && overlap(sv1, sv2) >= sv1.end-sv1.start;
-//	} else if (!sv1.precise && sv2.precise) {
-//		return distance(sv1, sv2) <= max_imprec_dist && overlap(sv1, sv2) >= sv2.end-sv2.start;
-//	} else if (!sv1.precise && !sv2.precise) {
-//		return distance(sv1, sv2) <= max_imprec_dist && overlap(sv1, sv2)/double(std::min(sv1.end-sv1.start, sv2.end-sv2.start)) >= 0.5;
 	} else {
-		return  distance(sv1, sv2) <= max_prec_dist && overlap(sv1, sv2) >= min_prec_frac_overlap &&
+		return  distance(sv1, sv2) <= max_prec_dist &&
+				overlap(sv1, sv2) >= min_prec_frac_overlap &&
 				abs(sv1.len()-sv2.len()) <= max_prec_len_diff;
 	}
 }
@@ -468,8 +311,8 @@ void print_cliques(std::vector<std::vector<int>>& cliques, std::vector<sv_t>& sv
         std::sort(clique_svs.begin(), clique_svs.end());
 
         mtx.lock();
-        out_sv_file << "CLUSTER_" << cluster_id << " " << chosen_sv.chr << " " << chosen_sv.start << " " << chosen_sv.str1;
-        out_sv_file << " " << chosen_sv.chr << " " << chosen_sv.end << " " << chosen_sv.str2 << " " << chosen_sv.type << " ";
+        out_sv_file << "CLUSTER_" << cluster_id << " " << chosen_sv.chr << " " << chosen_sv.start << " N ";
+        out_sv_file << chosen_sv.chr << " " << chosen_sv.end << " N " << chosen_sv.type << " ";
         out_sv_file << unique_samples.size() << " " << clique.size() << " " << (chosen_sv.ins_seq.empty() ? "NA" : chosen_sv.ins_seq) << " ";
 
         for (sv_t sv : clique_svs) {
