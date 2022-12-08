@@ -46,6 +46,7 @@ int distance(const sv_t& sv1, const sv_t& sv2) {
     return std::max(abs(sv1.start-sv2.start), abs(sv1.end-sv2.end));
 }
 double overlap(const sv_t& sv1, const sv_t& sv2) {
+	if (sv1.end == sv1.start == 0 || sv2.end == sv2.start) return 1.0; // TODO: how should I define the overlap if one of the two covers 0 bp?
     int overlap_bp = std::max(0, std::min(sv1.end, sv2.end)-std::max(sv1.start, sv2.start));
     return overlap_bp/double(std::min(sv1.end-sv1.start, sv2.end-sv2.start));
 }
