@@ -350,7 +350,7 @@ bcf_hrec_t* generate_contig_hrec() {
 	}
 	return contig_hrec;
 }
-bcf_hdr_t* generate_vcf_header(std::string command) {
+bcf_hdr_t* generate_vcf_header(std::string command, std::unordered_set<std::string>& called_by) {
 
 	bcf_hdr_t* out_hdr = bcf_hdr_init("w");
 
@@ -417,6 +417,11 @@ bcf_hdr_t* generate_vcf_header(std::string command) {
 	std::time_t now_time = std::chrono::system_clock::to_time_t(now);
 	std::string version_tag = "##SurVClustererVersion=" + VERSION + "; Date=" + std::ctime(&now_time);
 	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, version_tag.c_str(), &len));
+
+	for (std::string s : called_by) {
+		std::string called_by_tag = "##calledBy=" + s;
+		bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, called_by_tag.c_str(), &len));
+	}
 
 	std::stringstream clustered_by_ss;
 	clustered_by_ss << "##clusteredBy=SurVClusterer " << VERSION << "; ";
@@ -545,6 +550,7 @@ int main(int argc, char* argv[]) {
 
     std::string sample_name, sample_sv_fpath;
     bcf1_t* vcf_record = bcf_init();
+    std::unordered_set<std::string> called_by;
     while (file_list >> sample_name >> sample_sv_fpath) {
     	std::cout << "Reading SVs from " << sample_sv_fpath << std::endl;
     	htsFile* sample_sv_file = bcf_open(sample_sv_fpath.c_str(), "r");
@@ -552,7 +558,13 @@ int main(int argc, char* argv[]) {
 		if (vcf_header == NULL) {
 			throw std::runtime_error("Failed to read the VCF header of " + sample_sv_fpath + ".");
 		}
-		// TODO: using header of first file for output. Probably we should implement a consistency check
+
+		for (int i = 0; i < vcf_header->nhrec; i++) {
+			if (strcmp(vcf_header->hrec[i]->key, "calledBy") == 0) {
+				called_by.insert(vcf_header->hrec[i]->value);
+			}
+		}
+
     	while (bcf_read(sample_sv_file, vcf_header, vcf_record) == 0) {
     		sv_t sv(vcf_header, vcf_record, sample_name);
     		std::string seqname = bcf_seqname(vcf_header, vcf_record);
@@ -565,7 +577,7 @@ int main(int argc, char* argv[]) {
     bcf_destroy(vcf_record);
     std::cout << "Finished reading SVs." << std::endl;
 
-    bcf_hdr_t* out_hdr = generate_vcf_header(full_cmd);
+    bcf_hdr_t* out_hdr = generate_vcf_header(full_cmd, called_by);
     if (bcf_hdr_write(out_vcf_file, out_hdr) != 0) {
     	throw std::runtime_error("Could not write header to " + std::string(out_vcf_file->fn));
     }
