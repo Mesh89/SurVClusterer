@@ -55,6 +55,8 @@ double overlap(const sv_t& sv1, const sv_t& sv2) {
 }
 
 bool is_compatible(sv_t& sv1, sv_t& sv2) {
+	if (sv1.type != sv2.type) return false;
+
 	if (!sv1.precise || !sv2.precise) {
 		return  distance(sv1, sv2) <= max_imprec_dist &&
 				overlap(sv1, sv2) >= min_imprec_frac_overlap &&
