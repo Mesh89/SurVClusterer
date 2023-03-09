@@ -16,6 +16,7 @@
 
 std::mutex mtx;
 
+const std::string VERSION = "0.1";
 
 std::unordered_map<std::string, int> sample2id;
 std::vector<std::string> sample_names;
@@ -41,11 +42,14 @@ std::unordered_map<std::string, std::vector<bcf1_t*> > clustered_svs_by_chr;
 int max_prec_dist, max_imprec_dist, max_dist;
 double min_prec_frac_overlap, min_imprec_frac_overlap;
 int max_prec_len_diff, max_imprec_len_diff;
+bool overlap_for_ins;
 
 int distance(const sv_t& sv1, const sv_t& sv2) {
     return std::max(abs(sv1.start-sv2.start), abs(sv1.end-sv2.end));
 }
 double overlap(const sv_t& sv1, const sv_t& sv2) {
+	if (!overlap_for_ins && sv1.type == "INS" && sv2.type == "INS") return 1.0;
+	if (sv1.end == sv1.start || sv2.end == sv2.start) return 1.0; // TODO: how should I define the overlap if one of the two covers 0 bp?
     int overlap_bp = std::max(0, std::min(sv1.end, sv2.end)-std::max(sv1.start, sv2.start));
     return overlap_bp/double(std::min(sv1.end-sv1.start, sv2.end-sv2.start));
 }
@@ -344,7 +348,7 @@ bcf_hrec_t* generate_contig_hrec() {
 	}
 	return contig_hrec;
 }
-bcf_hdr_t* generate_vcf_header() {
+bcf_hdr_t* generate_vcf_header(std::string command) {
 
 	bcf_hdr_t* out_hdr = bcf_hdr_init("w");
 
@@ -404,6 +408,25 @@ bcf_hdr_t* generate_vcf_header() {
 	const char* ic_sv_tag = "##FORMAT=<ID=IC,Number=.,Type=String,Description=\"Whether the original insertion had an incomplete assembly. "
 				"T is TRUE and F is FALSE.\">";
 
+	std::string cmd_tag = "##SurVClustererCommand=" + command;
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, cmd_tag.c_str(), &len));
+
+	auto now = std::chrono::system_clock::now();
+	std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+	std::string version_tag = "##SurVClustererVersion=" + VERSION + "; Date=" + std::ctime(&now_time);
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, version_tag.c_str(), &len));
+
+	std::stringstream clustered_by_ss;
+	clustered_by_ss << "##clusteredBy=SurVClusterer " << VERSION << "; ";
+	clustered_by_ss << "max_dist_precise: " << max_prec_dist << "; ";
+	clustered_by_ss << "max_dist_imprecise: " << max_imprec_dist << "; ";
+	clustered_by_ss << "min_overlap_precise: " << min_prec_frac_overlap << "; ";
+	clustered_by_ss << "min_overlap_imprecise: " << min_imprec_frac_overlap << "; ";
+	clustered_by_ss << "max_len_diff_precise: " << max_prec_len_diff << "; ";
+	clustered_by_ss << "max_len_diff_imprecise: " << max_imprec_len_diff << "; ";
+	clustered_by_ss << "overlap_for_ins: " << (overlap_for_ins ? "true" : "false") << "; ";
+	bcf_hdr_add_hrec(out_hdr, bcf_hdr_parse_line(out_hdr, clustered_by_ss.str().c_str(), &len));
+
 	int i = 0;
 	for (std::string& sample_name : sample_names) {
 		sample2id[sample_name] = i++; // bcf_hdr_nsamples(out_hdr) does not work unless we sync the header
@@ -454,27 +477,29 @@ void cluster_contig(int id, std::string contig_name, bcf_hdr_t* out_hdr) {
 
 int main(int argc, char* argv[]) {
 
-	cxxopts::Options options("SVClusterer", "Clusters SVs across different samples.");
+	cxxopts::Options options("SurVClusterer", "Clusters SVs across different samples.");
 
 	options.add_options()
 			("filelist", "Filelist containing a line for each sample being clustered. The line must contain the name of the sample and the "
-					"path of its VCF file.", cxxopts::value<std::string>())
+					"path of its VCF file, space or tab separated.", cxxopts::value<std::string>())
 			("reference", "Reference genome in fasta format", cxxopts::value<std::string>())
 			("o,out_prefix", "Files out_prefix.vcf.gz|.sv will be produced.", cxxopts::value<std::string>()->default_value("clustered"))
 			("d,max_dist_precise", "Maximum distance allowed between the breakpoints of two precise variants.",
 					cxxopts::value<int>()->default_value("100"))
 			("D,max_dist_imprecise", "Maximum distance allowed between the breakpoints when at least one of the variants is imprecise.",
 					cxxopts::value<int>()->default_value("500"))
-			("v,min_overlap_precise", "Minimum overlap required between two precise variants, expressed as the fraction of the shortest variant"
+			("x,min_overlap_precise", "Minimum overlap required between two precise variants, expressed as the fraction of the shortest variant"
 					" that is covered by the longest variant.", cxxopts::value<double>()->default_value("0.8"))
-			("V,min_overlap_imprecise", "Minimum overlap required between two variants when at least one is imprecise, "
+			("X,min_overlap_imprecise", "Minimum overlap required between two variants when at least one is imprecise, "
 					"expressed as the fraction of the shortest variant that is covered by the longest variant.",
 					cxxopts::value<double>()->default_value("0.5"))
 			("s,max_len_diff_precise", "Maximum length difference allowed between two precise variants.",
 					cxxopts::value<int>()->default_value("100"))
 			("S,max_len_diff_imprecise", "Maximum length difference allowed when at least one variant is imprecise.",
 					cxxopts::value<int>()->default_value("500"))
+			("i,overlap_for_ins", "Require overlap for insertions.", cxxopts::value<bool>()->default_value("false"))
 			("t,threads", "Maximum number of threads used.", cxxopts::value<int>()->default_value("8"))
+			("v,version", "Print the version number and exit.")
 			("h,help", "Print usage");
 
 	options.parse_positional({"filelist", "reference"});
@@ -482,9 +507,18 @@ int main(int argc, char* argv[]) {
 	options.show_positional_help();
 	auto parsed_args = options.parse(argc, argv);
 
-	if (parsed_args.count("help") || !parsed_args.count("filelist") || !parsed_args.count("reference")) {
+	if (parsed_args.count("version")) {
+			std::cout << "SurVClusterer v" << VERSION << std::endl;
+			exit(0);
+	} else if (parsed_args.count("help") || !parsed_args.count("filelist") || !parsed_args.count("reference")) {
 		std::cout << options.help() << std::endl;
 		exit(0);
+	}
+
+	std::string full_cmd;
+	for (int i = 0; i < argc; i++) {
+		if (i > 0) full_cmd += " ";
+		full_cmd += argv[i];
 	}
 
     std::ifstream file_list(parsed_args["filelist"].as<std::string>());
@@ -496,6 +530,7 @@ int main(int argc, char* argv[]) {
     min_imprec_frac_overlap = parsed_args["min_overlap_imprecise"].as<double>();
     max_prec_len_diff = parsed_args["max_len_diff_precise"].as<int>();
     max_imprec_len_diff = parsed_args["max_len_diff_imprecise"].as<int>();
+    overlap_for_ins = parsed_args["overlap_for_ins"].as<bool>();
     std::string out_prefix = parsed_args["out_prefix"].as<std::string>();
     int n_threads = parsed_args["threads"].as<int>();
 
@@ -528,7 +563,7 @@ int main(int argc, char* argv[]) {
     bcf_destroy(vcf_record);
     std::cout << "Finished reading SVs." << std::endl;
 
-    bcf_hdr_t* out_hdr = generate_vcf_header();
+    bcf_hdr_t* out_hdr = generate_vcf_header(full_cmd);
     if (bcf_hdr_write(out_vcf_file, out_hdr) != 0) {
     	throw std::runtime_error("Could not write header to " + std::string(out_vcf_file->fn));
     }
