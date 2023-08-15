@@ -26,6 +26,11 @@ int get_sv_len(bcf_hdr_t* hdr, bcf1_t* sv) {
 		delete[] data;
 		return len;
 	}
+
+	if (sv->d.allele[1][0] != '<') {
+		return strlen(sv->d.allele[1])-strlen(sv->d.allele[0]);
+	}
+
 	return 0;
 }
 
